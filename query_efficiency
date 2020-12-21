@@ -1,0 +1,148 @@
+--use wh for large selects
+explain using json /* text, tabular, json */ SELECT SUM(1) AS "sum:Number of Records:ok"
+FROM "SNOWFLAKE_SAMPLE_DATA"."TPCDS_SF100TCL"."STORE_SALES"
+  LEFT JOIN "SNOWFLAKE_SAMPLE_DATA"."TPCDS_SF100TCL"."CUSTOMER" "CUSTOMER" ON ("STORE_SALES"."SS_CUSTOMER_SK" = "CUSTOMER"."C_CUSTOMER_SK")
+  LEFT JOIN "SNOWFLAKE_SAMPLE_DATA"."TPCDS_SF100TCL"."CUSTOMER_ADDRESS" "CUSTOMER_ADDRESS" ON ("CUSTOMER"."C_CURRENT_ADDR_SK" = "CUSTOMER_ADDRESS"."CA_ADDRESS_SK")
+  LEFT JOIN "SNOWFLAKE_SAMPLE_DATA"."TPCDS_SF100TCL"."ITEM" "ITEM" ON ("STORE_SALES"."SS_ITEM_SK" = "ITEM"."I_ITEM_SK")
+WHERE ((NOT ("ITEM"."I_MANUFACT" IS NULL)) AND 
+  ("STORE_SALES"."SS_SOLD_DATE_SK" IN (2451236,2451234,2451245,2451247,2451228,2451244,2451235,2451224,
+    2451223,2451238,2451226,2451227,2451242,2451250,2451237,2451231,2451249,2451243,2451251,2451239,2451230,
+    2451229,2451233,2451241,2451225,2451232,2451246)));
+
+--good select over explain plan for routing
+SELECT
+    (JSON:GlobalStats:bytesAssigned / POWER(1024,3))::DECIMAL(20,2) AS Compressed_GigaBytes_Addressed,
+    JSON:GlobalStats:partitionsAssigned AS Addressed_Partitions,
+    JSON:GlobalStats:partitionsTotal AS Total_Partitions,
+    ((JSON:GlobalStats:bytesAssigned / POWER(1024,2)) / Addressed_Partitions)::DECIMAL(10,2) AS Compressed_MegaBytes_Per_Partition,
+    (ZEROIFNULL(Addressed_Partitions / Total_Partitions) * 100)::DECIMAL(6,4) AS Scan_Percentage,
+    ARRAY_SIZE(JSON:Operations[0]) AS Number_Of_Operations,
+    (Compressed_GigaBytes_Addressed / Number_Of_Operations)::DECIMAL(10,2) AS Average_Compressed_GigaBytes_Per_Operation,
+    FLOOR((Addressed_Partitions / 80) /*10 per vCPU*/ * (Compressed_MegaBytes_Per_Partition / 16) * (Number_Of_Operations / 20)) AS Upper_Nodes_Hyper,
+    FLOOR((Addressed_Partitions / 40) /*5 per vCPU*/ * (Compressed_MegaBytes_Per_Partition / 16) * (Number_Of_Operations / 20)) AS Lower_Nodes_Hyper,
+    FLOOR((Addressed_Partitions / 400) /*50 per vCPU*/ * (Compressed_MegaBytes_Per_Partition / 16) * (Number_Of_Operations / 20)) AS Upper_Nodes_Recommended,
+    FLOOR((Addressed_Partitions / 200) /*25 per vCPU*/ * (Compressed_MegaBytes_Per_Partition / 16) * (Number_Of_Operations / 20)) AS Lower_Nodes_Recommended,
+    FLOOR((Addressed_Partitions / 1200) /*150 per vCPU*/ * (Compressed_MegaBytes_Per_Partition / 16) * (Number_Of_Operations / 20)) AS Upper_Nodes_Conservative,
+    FLOOR((Addressed_Partitions / 800) /*100 per vCPU*/ * (Compressed_MegaBytes_Per_Partition / 16) * (Number_Of_Operations / 20)) AS Lower_Nodes_Conservative,
+    FLOOR(ZEROIFNULL((Upper_Nodes_Hyper + Lower_Nodes_Hyper) / 2)) AS Hyper_Nodes,
+    FLOOR(ZEROIFNULL((Upper_Nodes_Recommended + Lower_Nodes_Recommended) / 2)) AS Recommended_Nodes,
+    FLOOR(ZEROIFNULL((Upper_Nodes_Conservative + Lower_Nodes_Conservative) / 2)) AS Conservative_Nodes,
+    CASE 
+        WHEN Hyper_Nodes <= 1 THEN 'XSmall'
+        WHEN Hyper_Nodes <= 2 THEN 'Small'
+        WHEN Hyper_Nodes <= 4 THEN 'Medium'
+        WHEN Hyper_Nodes <= 8 THEN 'Large'
+        WHEN Hyper_Nodes <= 16 THEN 'XLarge'
+        WHEN Hyper_Nodes <= 32 THEN '2XLarge'
+        WHEN Hyper_Nodes <= 64 THEN '3XLarge'
+        ELSE '4XLarge'
+    END AS Hyper_WH,
+    CASE 
+        WHEN Recommended_Nodes <= 1 THEN 'XSmall'
+        WHEN Recommended_Nodes <= 2 THEN 'Small'
+        WHEN Recommended_Nodes <= 4 THEN 'Medium'
+        WHEN Recommended_Nodes <= 8 THEN 'Large'
+        WHEN Recommended_Nodes <= 16 THEN 'XLarge'
+        WHEN Recommended_Nodes <= 32 THEN '2XLarge'
+        WHEN Recommended_Nodes <= 64 THEN '3XLarge'
+        ELSE '4XLarge'
+    END AS Recommended_WH,
+    CASE 
+        WHEN Conservative_Nodes <= 1 THEN 'XSmall'
+        WHEN Conservative_Nodes <= 2 THEN 'Small'
+        WHEN Conservative_Nodes <= 4 THEN 'Medium'
+        WHEN Conservative_Nodes <= 8 THEN 'Large'
+        WHEN Conservative_Nodes <= 16 THEN 'XLarge'
+        WHEN Conservative_Nodes <= 32 THEN '2XLarge'
+        WHEN Conservative_Nodes <= 64 THEN '3XLarge'
+        ELSE '4XLarge'
+    END AS Conservative_WH
+FROM
+    (SELECT PARSE_JSON($1)::VARIANT AS JSON FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())));
+    
+
+--session variables
+set date_start = dateadd('day', -1, current_date());
+select $date_start;
+set date_end = dateadd('day',-91,current_date());
+select $date_end;
+select datediff('day',$date_end, $date_start);
+
+--query history efficiency base select
+select
+    query_id,
+    start_time,
+    user_name,
+    warehouse_name,
+    warehouse_size,
+    execution_time,
+    partitions_scanned,
+    partitions_total,
+    bytes_scanned
+from
+    snowflake.account_usage.query_history
+where
+    is_client_generated_statement = false
+    and warehouse_size is not null
+    and partitions_scanned > 10
+    and date(start_time) between $date_end and $date_start;
+
+--query history efficiency with metrics
+select distinct warehouse_size
+from snowflake.account_usage.query_history
+where date(start_time) between $date_end and $date_start;
+
+select
+    query_id,
+    query_text,
+    start_time,
+    user_name,
+    warehouse_name,
+    warehouse_size,
+    execution_time,
+    partitions_scanned,
+    partitions_total,
+    (bytes_scanned / power(1024,3))::number(10,2) as gb_scanned,
+    ceil(partitions_scanned / 80) /*10 per vCPU*/ as hyper_nodes_low,
+    ceil(partitions_scanned / 40) /*5 per vCPU*/ as hyper_nodes_high,
+    ceil((hyper_nodes_low + hyper_nodes_high) / 2) as hyper_nodes_avg,
+    iff(hyper_nodes_avg>128,128,hyper_nodes_avg) as hyper_nodes_ceiling,
+    ceil(partitions_scanned / 400) /*50 per vCPU*/ as recommended_nodes_low,
+    ceil(partitions_scanned / 200) /*25 per vCPU*/ as recommended_nodes_high,
+    ceil((recommended_nodes_low + recommended_nodes_high) / 2) as recommended_nodes_avg,
+    iff(recommended_nodes_avg>128,128,recommended_nodes_avg) as recommended_nodes_ceiling,
+    ceil(partitions_scanned / 1200) /*150 per vCPU*/ as conservative_nodes_low,
+    ceil(partitions_scanned / 800) /*100 per vCPU*/ as conservative_nodes_high,
+    ceil((conservative_nodes_low + conservative_nodes_high) / 2) as conservative_nodes_avg,
+    iff(conservative_nodes_avg>128,128,conservative_nodes_avg) as conservative_nodes_ceiling,
+    case warehouse_size
+        when 'X-Small' then 1
+        when 'Small' then 2
+        when 'Medium' then 4
+        when 'Large' then 8
+        when 'X-Large' then 16
+        when '2X-Large' then 32
+        when '3X-Large' then 64
+        else 128
+    end as warehouse_nodes_used,
+    warehouse_nodes_used / hyper_nodes_avg as variance_to_hyper_avg,
+    warehouse_nodes_used / recommended_nodes_avg as variance_to_recommended_avg,
+    warehouse_nodes_used / conservative_nodes_avg as variance_to_conservative_avg,
+    ((-1 + (warehouse_nodes_used / hyper_nodes_ceiling))*100)::number(10,2) as variance_to_hyper_ceiling,
+    ((-1 + (warehouse_nodes_used / recommended_nodes_ceiling))*100)::number(10,2) as variance_to_recommended_ceiling,
+    ((-1 + (warehouse_nodes_used / conservative_nodes_ceiling))*100)::number(10,2) as variance_to_conservative_ceiling
+from
+    snowflake.account_usage.query_history
+where
+    is_client_generated_statement = false
+    and warehouse_size is not null
+    and partitions_scanned > 10
+    and date(start_time) between $date_end and $date_start
+order by
+    variance_to_recommended_ceiling desc;
+    
+/*
+    For Less Then 0 Smear to Floor of Ceiling to Balance Out
+    If >3,100% then make -3,100% as floor and allocation on me/floor %
+    (?) Include GB Scanned in Metric
+*/
